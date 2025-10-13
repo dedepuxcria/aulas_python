@@ -1,2 +1,2 @@
-# aulas_python
-Aulas de Python na Fucape
+# Aulas de python
+Conteúdo das aulas de Python praticadas na Fucape Bussiness School
