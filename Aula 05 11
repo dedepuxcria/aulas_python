@@ -1,0 +1,20 @@
+import matplotlib.pyplot as plt
+
+fig, axs = plt.subplots(2,2)
+
+#grafico 1
+axs[0,0].plot([1,2,3,4], [10,20,25,30])
+axs[0,0].set_title("Gráfico 1")
+
+#grafico 2
+axs[0,1].bar(["A", "B", "C", "D"], [5,7,6,8])
+axs[0,1].set_title("Gráfico 2")
+
+#Gráfico 3
+axs[1,0].scatter([1,2,3,4], [30,25,15,10])
+axs[1,0].set_title("Gráfico 3")
+
+#Gráfico 4
+axs[1,1].pie([40,20,10,25], labels=["A","B","C","D"])
+axs[1,1].set_title("Gráfico 4")
+plt.show()
