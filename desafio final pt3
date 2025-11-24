@@ -1,0 +1,353 @@
+from collections import defaultdict
+
+@app.route("/api/stats", methods=["POST"])
+def api_stats():
+    """
+    Retorna estatísticas e séries para gráficos.
+    Filtros opcionais: start, end.
+    """
+    if not logged_in():
+        return jsonify({"error": "Não autorizado"}), 401
+
+    payload = request.json or {}
+    start = payload.get("start", "")
+    end = payload.get("end", "")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT date, type, category, value FROM transactions WHERE user_id = ?",
+        (current_user_id(),)
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    # aplica filtro de período (se vier preenchido)
+    filtered = rows
+    if start and end:
+        try:
+            di = parse_date(start)
+            df = parse_date(end)
+            filtered = [
+                t for t in rows
+                if di <= parse_date(t["date"]) <= df
+            ]
+        except:
+            return jsonify({"error": "Datas inválidas no filtro"}), 400
+
+    # -------------------------
+    # 1) Total receitas e despesas
+    # -------------------------
+    total_receitas = sum(t["value"] for t in filtered if t["type"] == "entrada")
+    total_despesas = sum(t["value"] for t in filtered if t["type"] == "saida")
+    saldo_periodo = total_receitas - total_despesas
+
+    # -------------------------
+    # 2) Saldo mensal acumulado (série)
+    # -------------------------
+    # agrupa por YYYY-MM
+    por_mes = defaultdict(float)
+    for t in filtered:
+        dt = parse_date(t["date"])
+        chave = dt.strftime("%Y-%m")  # ex: 2025-11
+        if t["type"] == "entrada":
+            por_mes[chave] += t["value"]
+        else:
+            por_mes[chave] -= t["value"]
+
+    meses_ordenados = sorted(por_mes.keys())
+    saldo_acumulado = []
+    acumulado = 0.0
+    for m in meses_ordenados:
+        acumulado += por_mes[m]
+        saldo_acumulado.append(acumulado)
+
+    # -------------------------
+    # 3) Média de gastos por categoria (apenas saídas)
+    # -------------------------
+    gastos_cat = defaultdict(list)
+    for t in filtered:
+        if t["type"] == "saida":
+            gastos_cat[t["category"]].append(t["value"])
+
+    media_gastos_por_categoria = {
+        cat: (sum(vals) / len(vals))
+        for cat, vals in gastos_cat.items()
+    }
+
+    # -------------------------
+    # 4) Total gastos por categoria (para pizza)
+    # -------------------------
+    total_gastos_por_categoria = {
+        cat: sum(vals)
+        for cat, vals in gastos_cat.items()
+    }
+
+    return jsonify({
+        "total_receitas": total_receitas,
+        "total_despesas": total_despesas,
+        "saldo_periodo": saldo_periodo,
+        "meses": meses_ordenados,
+        "saldo_mensal_acumulado": saldo_acumulado,
+        "media_gastos_por_categoria": media_gastos_por_categoria,
+        "total_gastos_por_categoria": total_gastos_por_categoria
+    })
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="/static/main.js"></script>
+
+<section class="card table-card">
+  <h3>Estatísticas e Gráficos</h3>
+
+  <div class="stats-grid">
+    <div class="stat-box">
+      <h4>Total de Receitas</h4>
+      <p id="stat-receitas">R$ 0,00</p>
+    </div>
+    <div class="stat-box">
+      <h4>Total de Despesas</h4>
+      <p id="stat-despesas">R$ 0,00</p>
+    </div>
+    <div class="stat-box">
+      <h4>Saldo no período</h4>
+      <p id="stat-saldo">R$ 0,00</p>
+    </div>
+  </div>
+
+  <div class="charts-grid">
+    <div class="chart-box">
+      <h4>Gastos por categoria (Pizza)</h4>
+      <canvas id="pieChart"></canvas>
+    </div>
+
+    <div class="chart-box">
+      <h4>Saldo acumulado ao longo do tempo (Linha)</h4>
+      <canvas id="lineChart"></canvas>
+    </div>
+
+    <div class="chart-box">
+      <h4>Média de gastos por categoria (Barras)</h4>
+      <canvas id="barChart"></canvas>
+    </div>
+  </div>
+</section>
+
+let pieChart, lineChart, barChart;
+
+async function fetchTransactions() {
+  const res = await fetch("/api/transactions");
+  return await res.json();
+}
+
+function renderTable(list) {
+  const tbody = document.getElementById("tbody");
+  tbody.innerHTML = "";
+
+  list.forEach(t => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${t.date}</td>
+      <td>${t.type}</td>
+      <td>${t.category}</td>
+      <td>${t.description}</td>
+      <td>R$ ${Number(t.value).toFixed(2)}</td>
+      <td><button class="danger" onclick="removeTransaction(${t.id})">Remover</button></td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+async function loadAll() {
+  const list = await fetchTransactions();
+  renderTable(list);
+  document.getElementById("saldo").textContent = "R$ 0,00";
+  await loadStats();
+}
+
+async function addTransaction(e) {
+  e.preventDefault();
+
+  const data = {
+    date: document.getElementById("date").value,
+    type: document.getElementById("type").value,
+    category: document.getElementById("category").value,
+    description: document.getElementById("description").value,
+    value: document.getElementById("value").value
+  };
+
+  const res = await fetch("/api/transactions", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(data)
+  });
+
+  const json = await res.json();
+  const msg = document.getElementById("msg");
+
+  if (!res.ok) {
+    msg.textContent = json.error;
+    msg.className = "error";
+    return;
+  }
+
+  msg.textContent = "Transação adicionada!";
+  msg.className = "success";
+  e.target.reset();
+  loadAll();
+}
+
+async function removeTransaction(id) {
+  await fetch(`/api/transactions/${id}`, { method: "DELETE" });
+  loadAll();
+}
+
+async function filterTransactions(e) {
+  e.preventDefault();
+
+  const payload = {
+    category: document.getElementById("f-category").value,
+    start: document.getElementById("f-start").value,
+    end: document.getElementById("f-end").value
+  };
+
+  const res = await fetch("/api/summary", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+
+  const json = await res.json();
+  if (!res.ok) {
+    alert(json.error);
+    return;
+  }
+
+  renderTable(json.transactions);
+  document.getElementById("saldo").textContent = 
+    "R$ " + Number(json.saldo).toFixed(2);
+
+  await loadStats(payload.start, payload.end);
+}
+
+async function loadStats(start="", end="") {
+  const payload = { start, end };
+
+  const res = await fetch("/api/stats", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+  const stats = await res.json();
+
+  if (!res.ok) {
+    console.error(stats.error);
+    return;
+  }
+
+  document.getElementById("stat-receitas").textContent =
+    "R$ " + stats.total_receitas.toFixed(2);
+
+  document.getElementById("stat-despesas").textContent =
+    "R$ " + stats.total_despesas.toFixed(2);
+
+  document.getElementById("stat-saldo").textContent =
+    "R$ " + stats.saldo_periodo.toFixed(2);
+
+  renderPie(stats.total_gastos_por_categoria);
+  renderLine(stats.meses, stats.saldo_mensal_acumulado);
+  renderBar(stats.media_gastos_por_categoria);
+}
+
+function renderPie(dataObj) {
+  const labels = Object.keys(dataObj);
+  const values = Object.values(dataObj);
+
+  if (pieChart) pieChart.destroy();
+
+  pieChart = new Chart(document.getElementById("pieChart"), {
+    type: "pie",
+    data: {
+      labels,
+      datasets: [{ data: values }]
+    }
+  });
+}
+
+function renderLine(labels, values) {
+  if (lineChart) lineChart.destroy();
+
+  lineChart = new Chart(document.getElementById("lineChart"), {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        label: "Saldo acumulado",
+        data: values,
+        fill: false
+      }]
+    }
+  });
+}
+
+function renderBar(dataObj) {
+  const labels = Object.keys(dataObj);
+  const values = Object.values(dataObj);
+
+  if (barChart) barChart.destroy();
+
+  barChart = new Chart(document.getElementById("barChart"), {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [{
+        label: "Média de gastos",
+        data: values
+      }]
+    }
+  });
+}
+
+document.getElementById("form-add").addEventListener("submit", addTransaction);
+document.getElementById("form-filter").addEventListener("submit", filterTransactions);
+document.getElementById("btn-clear").addEventListener("click", loadAll);
+
+loadAll();
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 15px;
+}
+
+.stat-box {
+  background: #f9fafb;
+  padding: 10px;
+  border-radius: 8px;
+  text-align: center;
+  border: 1px solid #eee;
+}
+
+.stat-box p {
+  font-size: 20px;
+  font-weight: bold;
+  margin: 6px 0 0 0;
+}
+
+.charts-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 15px;
+}
+
+.chart-box {
+  background: #fff;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid #eee;
+}
+
+.chart-box canvas {
+  width: 100% !important;
+  height: 300px !important;
+}
