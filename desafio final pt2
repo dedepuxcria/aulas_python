@@ -1,0 +1,618 @@
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify, make_response
+from werkzeug.security import generate_password_hash, check_password_hash
+import sqlite3
+from datetime import datetime
+import csv
+import io
+
+app = Flask(__name__)
+app.secret_key = "chave-super-secreta"  # pode trocar depois
+
+
+DB_NAME = "finance.db"
+
+
+# -------------------------
+# Banco de dados
+# -------------------------
+def get_db():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL
+        );
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            type TEXT NOT NULL,
+            category TEXT NOT NULL,
+            description TEXT NOT NULL,
+            value REAL NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def logged_in():
+    return "user_id" in session
+
+
+def current_user_id():
+    return session.get("user_id")
+
+
+def parse_date(d):
+    return datetime.strptime(d, "%d/%m/%Y")
+
+
+def validate_transaction(data):
+    required = ["date", "type", "category", "description", "value"]
+    for r in required:
+        if r not in data or str(data[r]).strip() == "":
+            return False, f"Campo '{r}' está vazio."
+
+    # valida data
+    try:
+        parse_date(data["date"])
+    except:
+        return False, "Data inválida. Use dd/mm/aaaa."
+
+    # valida tipo
+    if data["type"] not in ["entrada", "saida"]:
+        return False, "Tipo deve ser 'entrada' ou 'saida'."
+
+    # valida valor
+    try:
+        v = float(data["value"])
+        if v <= 0:
+            return False, "Valor deve ser > 0."
+    except:
+        return False, "Valor inválido."
+
+    return True, ""
+
+
+# -------------------------
+# Rotas de páginas
+# -------------------------
+@app.route("/")
+def home():
+    if logged_in():
+        return redirect(url_for("dashboard"))
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        return render_template("login.html")
+
+    username = request.form.get("username", "").strip()
+    password = request.form.get("password", "").strip()
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE username = ?", (username,))
+    user = cur.fetchone()
+    conn.close()
+
+    if user and check_password_hash(user["password_hash"], password):
+        session["user_id"] = user["id"]
+        session["username"] = user["username"]
+        return redirect(url_for("dashboard"))
+
+    return render_template("login.html", error="Usuário ou senha inválidos.")
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "GET":
+        return render_template("register.html")
+
+    username = request.form.get("username", "").strip()
+    password = request.form.get("password", "").strip()
+
+    if len(username) < 3 or len(password) < 3:
+        return render_template("register.html", error="Usuário e senha devem ter pelo menos 3 caracteres.")
+
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (username, generate_password_hash(password))
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return render_template("register.html", error="Usuário já existe.")
+    conn.close()
+
+    return redirect(url_for("login"))
+
+
+@app.route("/dashboard")
+def dashboard():
+    if not logged_in():
+        return redirect(url_for("login"))
+    return render_template("dashboard.html", username=session["username"])
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+# -------------------------
+# API de transações (JSON)
+# -------------------------
+@app.route("/api/transactions", methods=["GET"])
+def api_list_transactions():
+    if not logged_in():
+        return jsonify({"error": "Não autorizado"}), 401
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC",
+        (current_user_id(),)
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/transactions", methods=["POST"])
+def api_add_transaction():
+    if not logged_in():
+        return jsonify({"error": "Não autorizado"}), 401
+
+    data = request.json
+    ok, msg = validate_transaction(data)
+    if not ok:
+        return jsonify({"error": msg}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO transactions (user_id, date, type, category, description, value)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        current_user_id(),
+        data["date"],
+        data["type"],
+        data["category"],
+        data["description"],
+        float(data["value"])
+    ))
+    conn.commit()
+    conn.close()
+
+    return jsonify({"success": True})
+
+
+@app.route("/api/transactions/<int:tid>", methods=["DELETE"])
+def api_delete_transaction(tid):
+    if not logged_in():
+        return jsonify({"error": "Não autorizado"}), 401
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM transactions WHERE id = ? AND user_id = ?",
+        (tid, current_user_id())
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({"success": True})
+
+
+@app.route("/api/summary", methods=["POST"])
+def api_summary():
+    """retorna lista filtrada + saldo no período"""
+    if not logged_in():
+        return jsonify({"error": "Não autorizado"}), 401
+
+    data = request.json
+    cat = data.get("category", "").strip().lower()
+    start = data.get("start", "")
+    end = data.get("end", "")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM transactions WHERE user_id = ?",
+        (current_user_id(),)
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    # filtros
+    filtered = rows
+
+    if cat:
+        filtered = [t for t in filtered if t["category"].lower() == cat]
+
+    if start and end:
+        try:
+            di = parse_date(start)
+            df = parse_date(end)
+            filtered = [
+                t for t in filtered
+                if di <= parse_date(t["date"]) <= df
+            ]
+        except:
+            return jsonify({"error": "Datas inválidas no filtro."}), 400
+
+    # saldo
+    saldo = 0.0
+    for t in filtered:
+        if t["type"] == "entrada":
+            saldo += t["value"]
+        else:
+            saldo -= t["value"]
+
+    return jsonify({"transactions": filtered, "saldo": saldo})
+
+
+# -------------------------
+# Exportar CSV
+# -------------------------
+@app.route("/export")
+def export_csv():
+    if not logged_in():
+        return redirect(url_for("login"))
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT date, type, category, description, value FROM transactions WHERE user_id = ? ORDER BY date",
+        (current_user_id(),)
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["data", "tipo", "categoria", "descricao", "valor"])
+    for r in rows:
+        writer.writerow([r["date"], r["type"], r["category"], r["description"], r["value"]])
+
+    response = make_response(output.getvalue())
+    response.headers["Content-Disposition"] = "attachment; filename=transacoes.csv"
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    return response
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8">
+  <title>Login</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="center">
+  <div class="card">
+    <h2>Login</h2>
+
+    {% if error %}
+      <p class="error">{{ error }}</p>
+    {% endif %}
+
+    <form method="POST">
+      <input name="username" placeholder="Usuário" required>
+      <input name="password" type="password" placeholder="Senha" required>
+      <button type="submit">Entrar</button>
+    </form>
+
+    <p>Não tem conta? <a href="/register">Cadastre-se</a></p>
+  </div>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8">
+  <title>Cadastro</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="center">
+  <div class="card">
+    <h2>Cadastro</h2>
+
+    {% if error %}
+      <p class="error">{{ error }}</p>
+    {% endif %}
+
+    <form method="POST">
+      <input name="username" placeholder="Usuário" required>
+      <input name="password" type="password" placeholder="Senha" required>
+      <button type="submit">Criar conta</button>
+    </form>
+
+    <p>Já tem conta? <a href="/login">Voltar ao login</a></p>
+  </div>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8">
+  <title>Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h2>Controle Financeiro - {{ username }}</h2>
+    <div>
+      <a class="btn" href="/export">Exportar CSV</a>
+      <a class="btn danger" href="/logout">Sair</a>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="card">
+      <h3>Adicionar transação</h3>
+
+      <form id="form-add">
+        <input id="date" placeholder="dd/mm/aaaa" required>
+        <select id="type" required>
+          <option value="">Tipo</option>
+          <option value="entrada">Entrada</option>
+          <option value="saida">Saída</option>
+        </select>
+        <input id="category" placeholder="Categoria" required>
+        <input id="description" placeholder="Descrição" required>
+        <input id="value" type="number" step="0.01" placeholder="Valor" required>
+        <button type="submit">Adicionar</button>
+      </form>
+
+      <p id="msg"></p>
+    </section>
+
+    <section class="card">
+      <h3>Filtros</h3>
+
+      <form id="form-filter">
+        <input id="f-category" placeholder="Categoria (opcional)">
+        <div class="row">
+          <input id="f-start" placeholder="Início dd/mm/aaaa">
+          <input id="f-end" placeholder="Fim dd/mm/aaaa">
+        </div>
+        <button type="submit">Filtrar</button>
+        <button type="button" id="btn-clear">Limpar</button>
+      </form>
+
+      <h4>Saldo do filtro: <span id="saldo">R$ 0,00</span></h4>
+    </section>
+  </main>
+
+  <section class="card table-card">
+    <h3>Transações</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Data</th>
+          <th>Tipo</th>
+          <th>Categoria</th>
+          <th>Descrição</th>
+          <th>Valor</th>
+          <th>Ação</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </section>
+
+  <script src="/static/main.js"></script>
+</body>
+</html>
+async function fetchTransactions() {
+  const res = await fetch("/api/transactions");
+  return await res.json();
+}
+
+function renderTable(list) {
+  const tbody = document.getElementById("tbody");
+  tbody.innerHTML = "";
+
+  list.forEach(t => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${t.date}</td>
+      <td>${t.type}</td>
+      <td>${t.category}</td>
+      <td>${t.description}</td>
+      <td>R$ ${Number(t.value).toFixed(2)}</td>
+      <td><button class="danger" onclick="removeTransaction(${t.id})">Remover</button></td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+async function loadAll() {
+  const list = await fetchTransactions();
+  renderTable(list);
+  document.getElementById("saldo").textContent = "R$ 0,00";
+}
+
+async function addTransaction(e) {
+  e.preventDefault();
+
+  const data = {
+    date: document.getElementById("date").value,
+    type: document.getElementById("type").value,
+    category: document.getElementById("category").value,
+    description: document.getElementById("description").value,
+    value: document.getElementById("value").value
+  };
+
+  const res = await fetch("/api/transactions", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(data)
+  });
+
+  const json = await res.json();
+  const msg = document.getElementById("msg");
+
+  if (!res.ok) {
+    msg.textContent = json.error;
+    msg.className = "error";
+    return;
+  }
+
+  msg.textContent = "Transação adicionada!";
+  msg.className = "success";
+  e.target.reset();
+  loadAll();
+}
+
+async function removeTransaction(id) {
+  await fetch(`/api/transactions/${id}`, { method: "DELETE" });
+  loadAll();
+}
+
+async function filterTransactions(e) {
+  e.preventDefault();
+
+  const payload = {
+    category: document.getElementById("f-category").value,
+    start: document.getElementById("f-start").value,
+    end: document.getElementById("f-end").value
+  };
+
+  const res = await fetch("/api/summary", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+
+  const json = await res.json();
+  if (!res.ok) {
+    alert(json.error);
+    return;
+  }
+
+  renderTable(json.transactions);
+  document.getElementById("saldo").textContent = 
+    "R$ " + Number(json.saldo).toFixed(2);
+}
+
+document.getElementById("form-add").addEventListener("submit", addTransaction);
+document.getElementById("form-filter").addEventListener("submit", filterTransactions);
+document.getElementById("btn-clear").addEventListener("click", loadAll);
+
+loadAll();
+
+                body {
+  font-family: Arial, sans-serif;
+  background: #f4f6f8;
+  margin: 0;
+}
+
+header {
+  background: #111827;
+  color: white;
+  padding: 15px 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.center {
+  height: 100vh; display: flex; align-items: center; justify-content: center;
+}
+
+.grid {
+  display: grid;
+  gap: 15px;
+  grid-template-columns: 1fr 1fr;
+  padding: 20px;
+}
+
+.card {
+  background: white;
+  padding: 15px;
+  border-radius: 8px;
+  box-shadow: 0 0 8px rgba(0,0,0,0.08);
+}
+
+.table-card {
+  margin: 0 20px 20px 20px;
+}
+
+.row {
+  display: flex; gap: 10px;
+}
+
+input, select, button {
+  width: 100%;
+  padding: 8px;
+  margin-top: 8px;
+  border-radius: 6px;
+  border: 1px solid #ccc;
+}
+
+button {
+  background: #2563eb;
+  color: white;
+  cursor: pointer;
+  border: none;
+}
+button:hover { opacity: 0.9; }
+
+.btn {
+  padding: 8px 12px;
+  background: #2563eb;
+  color: white;
+  text-decoration: none;
+  border-radius: 6px;
+  margin-left: 6px;
+}
+.btn.danger { background: #dc2626; }
+
+button.danger {
+  background: #dc2626;
+}
+
+.error { color: #dc2626; }
+.success { color: #16a34a; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th, td {
+  padding: 10px;
+  border-bottom: 1px solid #eee;
+  text-align: left;
+}
