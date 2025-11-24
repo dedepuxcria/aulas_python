@@ -1,0 +1,179 @@
+import json
+from datetime import datetime
+
+ARQUIVO = "transacoes.json"
+
+def carregar_transacoes():
+    try:
+        with open(ARQUIVO, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+
+def salvar_transacoes(transacoes):
+    with open(ARQUIVO, "w") as f:
+        json.dump(transacoes, f, indent=4)
+
+
+def validar_data(data_str):
+    try:
+        datetime.strptime(data_str, "%d/%m/%Y")
+        return True
+    except ValueError:
+        return False
+
+def adicionar_transacao():
+    transacoes = carregar_transacoes()
+
+    print("\n=== Adicionar Transação ===")
+
+    data = input("Data (dd/mm/yyyy): ")
+    while not validar_data(data):
+        print("Data inválida! Formato correto: dd/mm/yyyy")
+        data = input("Data (dd/mm/yyyy): ")
+
+    tipo = input("Tipo (entrada/saida): ").lower()
+    while tipo not in ["entrada", "saida"]:
+        print("Tipo inválido.")
+        tipo = input("Tipo (entrada/saida): ").lower()
+
+    categoria = input("Categoria: ").strip()
+    descricao = input("Descrição: ").strip()
+
+    try:
+        valor = float(input("Valor: "))
+    except ValueError:
+        print("Valor inválido! Operação cancelada.")
+        return
+
+    transacao = {
+        "data": data,
+        "tipo": tipo,
+        "categoria": categoria,
+        "descricao": descricao,
+        "valor": valor
+    }
+
+    transacoes.append(transacao)
+    salvar_transacoes(transacoes)
+    print("Transação adicionada com sucesso!")
+
+
+def remover_transacao():
+    transacoes = carregar_transacoes()
+
+    print("\n=== Remover Transação ===")
+    listar_todas(transacoes)
+
+    try:
+        indice = int(input("\nDigite o número da transação para remover: "))
+        transacoes.pop(indice)
+        salvar_transacoes(transacoes)
+        print("Transação removida!")
+    except:
+        print("Índice inválido.")
+
+
+def listar_todas(transacoes):
+    if not transacoes:
+        print("Nenhuma transação encontrada.")
+        return
+
+    for i, t in enumerate(transacoes):
+        print(f"{i} - {t['data']} | {t['tipo']} | R${t['valor']:.2f} | {t['categoria']} | {t['descricao']}")
+
+
+def listar_por_categoria():
+    transacoes = carregar_transacoes()
+    categoria = input("\nDigite a categoria: ").strip()
+
+    lista = [t for t in transacoes if t["categoria"].lower() == categoria.lower()]
+
+    print(f"\n=== Transações da categoria '{categoria}' ===")
+    listar_todas(lista)
+
+
+def listar_por_periodo():
+    transacoes = carregar_transacoes()
+
+    data_inicio = input("Data início (dd/mm/yyyy): ")
+    while not validar_data(data_inicio):
+        print("Data inválida.")
+        data_inicio = input("Data início (dd/mm/yyyy): ")
+
+    data_fim = input("Data fim (dd/mm/yyyy): ")
+    while not validar_data(data_fim):
+        print("Data inválida.")
+        data_fim = input("Data fim (dd/mm/yyyy): ")
+
+    di = datetime.strptime(data_inicio, "%d/%m/%Y")
+    df = datetime.strptime(data_fim, "%d/%m/%Y")
+
+    lista = [
+        t for t in transacoes
+        if di <= datetime.strptime(t["data"], "%d/%m/%Y") <= df
+    ]
+
+    print(f"\n=== Transações do período {data_inicio} a {data_fim} ===")
+    listar_todas(lista)
+
+
+def calcular_saldo_periodo():
+    transacoes = carregar_transacoes()
+
+    data_inicio = input("Data início (dd/mm/yyyy): ")
+    while not validar_data(data_inicio):
+        data_inicio = input("Data início (dd/mm/yyyy): ")
+
+    data_fim = input("Data fim (dd/mm/yyyy): ")
+    while not validar_data(data_fim):
+        data_fim = input("Data fim (dd/mm/yyyy): ")
+
+    di = datetime.strptime(data_inicio, "%d/%m/%Y")
+    df = datetime.strptime(data_fim, "%d/%m/%Y")
+
+    saldo = 0
+
+    for t in transacoes:
+        data_t = datetime.strptime(t["data"], "%d/%m/%Y")
+        if di <= data_t <= df:
+            if t["tipo"] == "entrada":
+                saldo += t["valor"]
+            else:
+                saldo -= t["valor"]
+
+    print(f"\nSaldo do período: R${saldo:.2f}")
+
+def menu():
+    while True:
+        print("\n=== Sistema Financeiro Pessoal ===")
+        print("1 - Adicionar transação")
+        print("2 - Remover transação")
+        print("3 - Listar por categoria")
+        print("4 - Listar por período")
+        print("5 - Calcular saldo por período")
+        print("6 - Listar todas as transações")
+        print("0 - Sair")
+
+        opcao = input("Escolha: ")
+
+        if opcao == "1":
+            adicionar_transacao()
+        elif opcao == "2":
+            remover_transacao()
+        elif opcao == "3":
+            listar_por_categoria()
+        elif opcao == "4":
+            listar_por_periodo()
+        elif opcao == "5":
+            calcular_saldo_periodo()
+        elif opcao == "6":
+            listar_todas(carregar_transacoes())
+        elif opcao == "0":
+            print("Saindo...")
+            break
+        else:
+            print("Opção inválida.")
+
+menu()
